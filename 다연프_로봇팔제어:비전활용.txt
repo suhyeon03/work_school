@@ -1,0 +1,486 @@
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import serial
+import time
+import os
+import sys
+import math
+import traceback
+
+# --- 상수 정의 ---
+LEFT_CAM = 0
+SERIAL_PORT = 'COM10' # 사용 환경에 맞게 수정
+BAUD_RATE = 9600
+# L1, L2 등 로봇팔 관련 상수는 현재 IK 계산에 직접 사용되지 않음
+K_PAN = 0.03  # 팬 정렬 게인 (값이 클수록 민감하게 반응, 부호는 서보 방향에 따라 조정)
+TOLERANCE = 10  # 정렬 허용 오차 (픽셀) - 필요시 더 정밀하게 조정
+IMG_WIDTH = 640
+IMG_HEIGHT = 480
+U0_VIS = IMG_WIDTH // 2  # 시각화용 이미지 중심 u 좌표 (물리적 중앙)
+V0_VIS = IMG_HEIGHT // 2  # 시각화용 이미지 중심 v 좌표 (물리적 중앙)
+
+DELAY = 0.5  # 일반적인 서보 이동 후 짧은 안정화 시간 (초)
+SCAN_DURATION = 3.0  # 각도별 스캔 지속 시간 (초) - 이 시간 동안 CHECK_INTERVAL 간격으로 탐색
+CHECK_INTERVAL = 0.5  # 스캔 중 객체 탐색 간격 (초)
+GRIP_DELAY = 2.0  # 그리퍼 동작 관련 딜레이 (초)
+
+# 안정화 딜레이 상수
+INITIAL_SYSTEM_STABILIZATION_DELAY = 3.0 # 초기 시스템 안정화 시간 (초)
+POST_PAN_STABILIZATION_DELAY = 3.0     # 팬 회전 후 화면 안정화 시간 (초)
+
+
+# 서보 각도 제한 (실제 로봇팔의 물리적 한계에 맞게 조정 필요)
+JOINT1_MIN = 0; JOINT1_MAX = 180
+JOINT2_MIN = 0; JOINT2_MAX = 180
+GRIPPER_MIN = 0; GRIPPER_MAX = 180 # 파이썬에서 보내는 명령 각도가 이 범위 내에 있어야 함
+PAN_MIN = 0; PAN_MAX = 180
+
+# 초기 각도 및 명령 각도 정의
+JOINT1_INIT = 90
+JOINT2_INIT = 90
+PAN_INIT = 90
+GRIPPER_OPEN_CMD = 60 # 이전 요청에 따라 60으로 설정 (열림)
+GRIPPER_CLOSE_CMD = 180 # 이전 요청에 따라 180으로 설정 (닫힘)
+REACH_OUT_J1 = 90; REACH_OUT_J2 = 150
+RETRIEVE_J1 = 0; RETRIEVE_J2 = 90
+
+# --- 시각화 설정 ---
+WINDOW_NAME = "Object Detection Cam L (Alignment on Undistorted)"
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+FONT_SCALE = 0.7
+TEXT_COLOR = (0, 255, 0) # BGR: Green
+BBOX_COLOR = (255, 0, 0) # BGR: Blue
+CENTROID_COLOR = (0, 0, 255) # BGR: Red
+TARGET_CROSSHAIR_COLOR_VIS = (0, 255, 255) # BGR: Yellow (시각화용 중앙 마커)
+CALIB_CROSSHAIR_COLOR = (255, 0, 255) # BGR: Magenta (캘리브레이션된 주점 마커)
+
+
+# --- 전역 변수 ---
+ser = None
+cap_L = None
+last_displayed_frame = np.zeros((IMG_HEIGHT, IMG_WIDTH, 3), dtype=np.uint8)
+K_L_matrix = None # 왼쪽 카메라 내부 매트릭스
+D_L_coeffs = None # 왼쪽 카메라 왜곡 계수
+U0_calib = None   # 캘리브레이션된 주점 cx (팬 정렬 기준점)
+
+# --- 프레임에 정보 그리기 및 표시 함수 ---
+def display_frame_with_info(base_frame, status_texts=None, bbox=None, centroid_coords=None):
+    global last_displayed_frame, U0_VIS, V0_VIS, U0_calib # U0_calib도 사용 가능하도록 추가
+    display_image = base_frame.copy()
+
+    # 시각화용 물리적 이미지 중심 마커
+    cv2.drawMarker(display_image, (U0_VIS, V0_VIS), TARGET_CROSSHAIR_COLOR_VIS,
+                   markerType=cv2.MARKER_CROSS, markerSize=20, thickness=1)
+
+    # 캘리브레이션된 주점(U0_calib)이 있으면 해당 위치에도 마커 표시 (옵션)
+    if U0_calib is not None:
+        cv2.drawMarker(display_image, (int(U0_calib), V0_VIS), CALIB_CROSSHAIR_COLOR,
+                       markerType=cv2.MARKER_TILTED_CROSS, markerSize=20, thickness=1)
+
+    if bbox is not None:
+        try:
+            x1, y1, x2, y2 = map(int, bbox)
+            cv2.rectangle(display_image, (x1, y1), (x2, y2), BBOX_COLOR, 2)
+        except Exception as e:
+            print(f"Debug: Error drawing bbox: {e}, bbox value: {bbox}")
+
+    if centroid_coords is not None and centroid_coords[0] is not None and centroid_coords[1] is not None:
+        try:
+            cx, cy = map(int, centroid_coords)
+            cv2.circle(display_image, (cx, cy), 5, CENTROID_COLOR, -1)
+            cv2.putText(display_image, f"({cx},{cy})", (cx + 10, cy + 10),
+                        FONT, 0.5, CENTROID_COLOR, 1)
+        except Exception as e:
+            print(f"Debug: Error drawing centroid: {e}, centroid_coords value: {centroid_coords}")
+
+    y_offset = 30
+    if status_texts:
+        if isinstance(status_texts, str): status_texts = [status_texts]
+        for text_line in status_texts:
+            cv2.putText(display_image, text_line, (10, y_offset), FONT, FONT_SCALE, TEXT_COLOR, 2, cv2.LINE_AA)
+            y_offset += 30
+
+    cv2.imshow(WINDOW_NAME, display_image)
+    last_displayed_frame = display_image.copy()
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        print("'q' 키 입력으로 프로그램을 종료합니다.")
+        return True
+    return False
+
+# 시리얼 포트 설정 함수
+def setup_serial(port, baudrate, timeout_val):
+    try:
+        s = serial.Serial(port, baudrate, timeout=timeout_val)
+        print(f"시리얼 포트 {port} 연결 시도 중...")
+        time.sleep(2) # 아두이노 리셋 및 시리얼 초기화 대기
+        if s.is_open:
+            print(f"시리얼 포트 {port}에 성공적으로 연결되었습니다.")
+            return s
+        else:
+             raise serial.SerialException(f"시리얼 포트 {port} 열기 실패 (is_open: False)")
+    except serial.SerialException as e:
+        print(f"시리얼 포트 {port} 열기 오류: {e}")
+        print("포트 이름, 권한, 아두이노 연결 상태를 확인하세요.")
+        sys.exit(1)
+
+# 프레임 캡처 함수
+def capture_frame(camera_capture_obj, cap_name_str="Camera"):
+    ret, frame = camera_capture_obj.read()
+    if not ret:
+        print(f"경고: {cap_name_str}에서 프레임 읽기 실패. 재시도 중...")
+        time.sleep(0.1)
+        ret, frame = camera_capture_obj.read()
+        if not ret:
+            raise Exception(f"{cap_name_str}에서 프레임을 최종적으로 캡처하지 못했습니다.")
+    return frame
+
+# 객체 탐지 함수
+def detect_object(yolo_model_obj, frame_to_process, target_class_name_str):
+    results = yolo_model_obj(frame_to_process, verbose=False)
+    for result in results:
+        for box in result.boxes:
+            class_id = int(box.cls[0])
+            detected_class_name = yolo_model_obj.names[class_id]
+            if detected_class_name == target_class_name_str:
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(float) # float으로 명시적 변환
+                return (x1, y1, x2, y2)
+    return None
+
+# 중심점 계산 함수
+def compute_centroid(bbox_coords_tuple):
+    if bbox_coords_tuple is None: return None, None
+    x1, y1, x2, y2 = bbox_coords_tuple
+    return (x1 + x2) / 2.0, (y1 + y2) / 2.0 # float 반환 명시
+
+# 시리얼 명령 전송 함수
+def send_serial_command(serial_connection, command_string):
+    try:
+        if serial_connection and serial_connection.is_open:
+            final_command_to_send = command_string + "\n"
+            print(f"명령 전송: {command_string}")
+            serial_connection.write(final_command_to_send.encode('utf-8'))
+            serial_connection.flush()
+            time.sleep(0.05)
+            # response = serial_connection.readline().decode('utf-8').strip() # ACK 필요시
+            # if response: print(f"Arduino 응답: {response}")
+            return True
+        else:
+            print("오류: 시리얼 포트가 열려있지 않습니다.")
+            return False
+    except Exception as e:
+        print(f"시리얼 통신 중 오류: {e}")
+        return False
+
+# 캘리브레이션 데이터 로드 함수
+def load_calibration_data():
+    global K_L_matrix, D_L_coeffs, U0_calib # 전역 변수 업데이트
+    calib_file_single = 'calibration_data.npy' # cam1 (왼쪽 카메라)의 mtx, dist를 포함해야 함
+
+    if not os.path.exists(calib_file_single):
+        print(f"오류: 팬 정렬에 필요한 캘리브레이션 파일({calib_file_single})을 찾을 수 없습니다.")
+        print("이 파일이 없으면 왜곡 보정을 사용한 정밀 팬 정렬이 불가능합니다.")
+        sys.exit(1)
+    try:
+        calib_data = np.load(calib_file_single, allow_pickle=True).item()
+        if 'cam1' not in calib_data or 'mtx' not in calib_data['cam1'] or 'dist' not in calib_data['cam1']:
+            print(f"오류: {calib_file_single} 파일 내에 'cam1' 키 또는 하위 'mtx', 'dist' 정보가 없습니다.")
+            sys.exit(1)
+
+        K_L_matrix = np.array(calib_data['cam1']['mtx'])
+        D_L_coeffs = np.array(calib_data['cam1']['dist'])
+        U0_calib = K_L_matrix[0, 2]  # 왼쪽 카메라의 주점 cx (카메라 매트릭스의 K_L[0,2] 항목)
+
+        if K_L_matrix is None or D_L_coeffs is None or U0_calib is None:
+             print(f"오류: {calib_file_single} 파일에서 K_L, D_L 또는 U0_calib 추출 실패.")
+             sys.exit(1)
+
+        print("캘리브레이션 데이터 (K_L, D_L) 로드 완료.")
+        print(f"팬 정렬 기준 주점 U0_calib (cx): {U0_calib:.2f} px")
+
+    except Exception as e:
+        print(f"캘리브레이션 데이터 로드 중 치명적 오류: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+# --- 메인 실행 로직 ---
+try:
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
+    ser = setup_serial(SERIAL_PORT, BAUD_RATE, timeout_val=1)
+
+    cap_L = cv2.VideoCapture(LEFT_CAM)
+    if not cap_L.isOpened():
+        raise IOError(f"왼쪽 카메라({LEFT_CAM})를 열 수 없습니다.")
+    print("왼쪽 카메라 초기화 완료.")
+    cap_L.set(cv2.CAP_PROP_FRAME_WIDTH, IMG_WIDTH)
+    cap_L.set(cv2.CAP_PROP_FRAME_HEIGHT, IMG_HEIGHT)
+
+    load_calibration_data() # K_L_matrix, D_L_coeffs, U0_calib 전역 변수 설정
+
+    model_path = 'best.pt' # 사용자의 YOLO 모델 경로
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"YOLO 모델 파일({model_path})을 찾을 수 없습니다.")
+    model = YOLO(model_path)
+    print(f"YOLO 모델 '{model_path}' 로드 완료.")
+
+    # --- 초기화 ---
+    status_texts = [f"Initializing Robot @ PAN:{PAN_INIT}, IK:{JOINT1_INIT},{JOINT2_INIT}, GRIP:{GRIPPER_OPEN_CMD}"]
+    try:
+        temp_frame_raw = capture_frame(cap_L, "Left Cam (Init Display)")
+        temp_frame_display = cv2.undistort(temp_frame_raw, K_L_matrix, D_L_coeffs, None, K_L_matrix)
+        if display_frame_with_info(temp_frame_display, status_texts=status_texts): sys.exit(0)
+    except Exception as e:
+        print(f"초기 프레임 표시 중 오류: {e}"); sys.exit(1)
+
+    print("로봇팔 초기 위치로 이동 중...")
+    if not send_serial_command(ser, f"PAN:{PAN_INIT}"): print("초기 PAN 설정 실패."); sys.exit(1)
+    if not send_serial_command(ser, f"IK:{JOINT1_INIT},{JOINT2_INIT}"): print("초기 IK 설정 실패."); sys.exit(1)
+    if not send_serial_command(ser, f"GRIP:{GRIPPER_OPEN_CMD}"): print("초기 그리퍼 열기 실패."); sys.exit(1)
+
+    print(f"초기 자세 설정 완료. 시스템 안정화 대기 중... ({INITIAL_SYSTEM_STABILIZATION_DELAY}초)")
+    status_texts.append(f"Initial System Stabilizing... ({INITIAL_SYSTEM_STABILIZATION_DELAY}s)")
+    start_time = time.time()
+    while time.time() - start_time < INITIAL_SYSTEM_STABILIZATION_DELAY:
+        elapsed_time = time.time() - start_time
+        remaining_time = INITIAL_SYSTEM_STABILIZATION_DELAY - elapsed_time
+        current_stabilize_status = status_texts[:] # 복사
+        current_stabilize_status[-1] = f"Initial System Stabilizing... {remaining_time:.1f}s left"
+        try:
+            frame_stabilizing_init_raw = capture_frame(cap_L, "Left Cam (Initial Stabilizing)")
+            frame_stabilizing_init_display = cv2.undistort(frame_stabilizing_init_raw, K_L_matrix, D_L_coeffs, None, K_L_matrix)
+            if display_frame_with_info(frame_stabilizing_init_display, status_texts=current_stabilize_status): sys.exit(0)
+        except Exception as e:
+            print(f"초기 안정화 중 프레임 표시 오류: {e}")
+        # time.sleep(0.1) # 너무 짧은 루프 방지, waitKey(1)이 이 역할 수행
+    status_texts[-1] = "Initial System Stabilized. Ready to scan." # 마지막 메시지 업데이트
+
+
+    # --- Stage 0: 객체 스캔 ---
+    print("\n--- Stage 0: 객체 스캔 시작 ---")
+    print("사용 가능한 YOLO 클래스:", list(model.names.values()))
+    target_class = input("탐지할 객체의 클래스 이름을 정확히 입력하세요: ").strip()
+    if not target_class:
+        print("입력된 클래스 이름이 없습니다. 프로그램을 종료합니다."); sys.exit(1)
+    if target_class not in model.names.values():
+        print(f"오류: '{target_class}'는 YOLO 모델에서 지원하지 않는 클래스입니다. 사용 가능한 클래스: {list(model.names.values())}"); sys.exit(1)
+    status_texts.append(f"Target Class: '{target_class}'")
+
+
+    found_object_scan = False
+    current_pan_angle = float(PAN_INIT) # 부동소수점으로 관리
+    scan_angles = [float(PAN_INIT), 30.0, 60.0, 120.0, 150.0] # 다양한 각도 시도
+
+    for pan_angle_cmd in scan_angles:
+        status_texts_scan_loop = status_texts[:] + [f"Stage 0: Scanning..."]
+        print(f"\n--- 스캔 시작: 목표 PAN 각도 {pan_angle_cmd:.1f}도 ---")
+
+        if not send_serial_command(ser, f"PAN:{pan_angle_cmd:.1f}"): print(f"PAN 명령 실패(스캔 Angle {pan_angle_cmd:.1f})."); sys.exit(1)
+        current_pan_angle = pan_angle_cmd # 실제 명령된 각도로 업데이트
+        print(f"PAN 서보 이동 중... ({DELAY}초 대기)")
+        time.sleep(DELAY)
+
+        print(f"카메라 및 화면 안정화 대기... ({POST_PAN_STABILIZATION_DELAY}초)")
+        status_texts_stabilizing_pan = status_texts_scan_loop + [f"PAN: {current_pan_angle:.1f} deg", f"Stabilizing view..."]
+        start_time_pan_stabilize = time.time()
+        while time.time() - start_time_pan_stabilize < POST_PAN_STABILIZATION_DELAY:
+            elapsed_pan_stabilize = time.time() - start_time_pan_stabilize
+            remaining_pan_stabilize = POST_PAN_STABILIZATION_DELAY - elapsed_pan_stabilize
+            current_pan_stabilize_status = status_texts_stabilizing_pan[:]
+            current_pan_stabilize_status[-1] = f"Stabilizing view... {remaining_pan_stabilize:.1f}s left"
+            try:
+                frame_stabilizing_raw = capture_frame(cap_L, "Left Cam (PAN Stabilizing)")
+                frame_stabilizing_display = cv2.undistort(frame_stabilizing_raw, K_L_matrix, D_L_coeffs, None, K_L_matrix)
+                if display_frame_with_info(frame_stabilizing_display, status_texts=current_pan_stabilize_status): sys.exit(0)
+            except Exception as e:
+                print(f"팬 안정화 중 프레임 표시 오류: {e}")
+
+        num_checks = int(SCAN_DURATION / CHECK_INTERVAL)
+        print(f"안정화 완료. {SCAN_DURATION:.1f}초 동안 객체 탐색 시작 (매 {CHECK_INTERVAL:.1f}초 간격, 총 {num_checks}회 확인)")
+        for check_idx in range(num_checks):
+            current_status_detect = status_texts_scan_loop + [f"PAN: {current_pan_angle:.1f} deg", f"Detecting... Check {check_idx+1}/{num_checks}"]
+            try:
+                frame_scan_raw = capture_frame(cap_L, "Left Cam (Scan Detect)")
+                frame_scan_for_detection = cv2.undistort(frame_scan_raw, K_L_matrix, D_L_coeffs, None, K_L_matrix) # 스캔 시에도 왜곡 보정된 프레임에서 탐지
+                frame_scan_for_display = frame_scan_for_detection.copy() # 표시용 프레임
+            except Exception as e: print(f"프레임 캡처/왜곡보정 오류(스캔): {e}"); sys.exit(1)
+
+            bbox_scan = detect_object(model, frame_scan_for_detection, target_class)
+
+            if bbox_scan is not None:
+                print(f"객체 '{target_class}' 발견! PAN: {current_pan_angle:.1f}도")
+                found_object_scan = True
+                current_status_detect.append(f"Object '{target_class}' FOUND!")
+                centroid_scan = compute_centroid(bbox_scan)
+                if display_frame_with_info(frame_scan_for_display, status_texts=current_status_detect, bbox=bbox_scan, centroid_coords=centroid_scan): sys.exit(0)
+                break
+            else:
+                if display_frame_with_info(frame_scan_for_display, status_texts=current_status_detect): sys.exit(0)
+            if check_idx < num_checks - 1: time.sleep(CHECK_INTERVAL)
+        if found_object_scan: break
+
+    if not found_object_scan:
+        final_status_msg = f"Object '{target_class}' not found after scanning all angles."
+        print(final_status_msg)
+        status_texts.append(final_status_msg)
+        if display_frame_with_info(last_displayed_frame, status_texts=status_texts): pass
+        time.sleep(3)
+        sys.exit(0)
+    status_texts.append(f"Object '{target_class}' found. Proceeding to alignment.")
+
+
+    # --- Stage 1: 팬 정렬 (왜곡 보정 프레임 및 U0_calib 사용) ---
+    print(f"\n--- Stage 1: 팬 정렬 시작 (기준 U0_calib: {U0_calib:.2f}px) ---")
+    status_texts.append(f"Stage 1: Aligning PAN to U0_calib={U0_calib:.2f}px (Undistorted)")
+    alignment_attempts = 0
+    max_alignment_attempts = 25 # 정렬 시도 횟수
+
+    while alignment_attempts < max_alignment_attempts:
+        alignment_attempts += 1
+        status_current_align_loop = status_texts[:] + [
+            f"Align Attempt: {alignment_attempts}/{max_alignment_attempts}",
+            f"Current PAN: {current_pan_angle:.1f} deg"
+        ]
+        print(f"\n정렬 시도 {alignment_attempts}/{max_alignment_attempts}, 현재 PAN: {current_pan_angle:.1f}°")
+        try:
+            frame_L_raw_align = capture_frame(cap_L, "Left Cam (Align)")
+        except Exception as e: print(f"프레임 캡처 오류(정렬): {e}"); sys.exit(1)
+
+        frame_L_undistorted_align = cv2.undistort(frame_L_raw_align, K_L_matrix, D_L_coeffs, None, K_L_matrix)
+        bbox_align = detect_object(model, frame_L_undistorted_align, target_class)
+
+        if bbox_align is None:
+            status_lost_align = status_current_align_loop + ["Object lost during alignment! Retrying or holding position."]
+            print("정렬 중 객체를 잃었습니다. 잠시 후 재시도합니다.")
+            if display_frame_with_info(frame_L_undistorted_align, status_texts=status_lost_align): sys.exit(0)
+            time.sleep(1.0) # 객체가 다시 나타날 수 있도록 잠시 대기
+            continue
+
+        u_align, v_align = compute_centroid(bbox_align)
+        if u_align is None: print("Centroid 계산 실패(정렬)."); sys.exit(1)
+
+        delta_u = u_align - U0_calib # 캘리브레이션된 주점(cx) 기준 오차
+        status_current_align_loop.append(f"Obj Center(Undist):({int(u_align)},{int(v_align)}), Target U0: {U0_calib:.1f}, Err: {delta_u:.1f}px")
+        print(f"객체 중심(왜곡보정): ({u_align:.1f},{v_align:.1f}), 기준 중심 U0_calib: {U0_calib:.1f}, 오차: {delta_u:.1f}px")
+
+        if display_frame_with_info(frame_L_undistorted_align, status_texts=status_current_align_loop,
+                                   bbox=bbox_align, centroid_coords=(u_align, v_align)): sys.exit(0)
+
+        if abs(delta_u) < TOLERANCE:
+            print(f"팬 정렬 완료! 최종 PAN: {current_pan_angle:.1f}° (U0_calib 기준)")
+            status_texts.append(f"Alignment Complete! Final PAN: {current_pan_angle:.1f} deg")
+            break
+
+        pan_adjustment = K_PAN * delta_u
+        target_pan_angle_calc = current_pan_angle - pan_adjustment # K_PAN 부호 및 서보 방향에 따라 '+' 또는 '-' 조정 필요
+        target_pan_angle_cmd = np.clip(target_pan_angle_calc, PAN_MIN, PAN_MAX) # NumPy clip 사용
+
+        print(f"계산된 목표 PAN: {target_pan_angle_calc:.1f}°, 명령 PAN: {target_pan_angle_cmd:.1f}° (조정량: {-pan_adjustment:.1f}°)")
+
+        step_size = 3.0 # 한 번에 움직일 최대 각도
+        delay_per_step = 0.05
+
+        if not math.isclose(target_pan_angle_cmd, current_pan_angle, abs_tol=0.1):
+            # 목표 각도와 현재 각도 차이가 크면 단계적으로 이동
+            if abs(target_pan_angle_cmd - current_pan_angle) > step_size * 1.5 : # 큰 차이일 때만 단계적 이동
+                temp_target_for_step = current_pan_angle
+                print("단계적 PAN 이동 시작...")
+                while not math.isclose(temp_target_for_step, target_pan_angle_cmd, abs_tol=step_size/2): # 목표에 근접할 때까지
+                    direction = 1 if target_pan_angle_cmd > temp_target_for_step else -1
+                    next_angle_step = temp_target_for_step + direction * step_size
+                    if direction == 1: next_angle_step = min(next_angle_step, target_pan_angle_cmd)
+                    else: next_angle_step = max(next_angle_step, target_pan_angle_cmd)
+                    if math.isclose(next_angle_step, temp_target_for_step, abs_tol=0.1): break
+
+                    if not send_serial_command(ser, f"PAN:{next_angle_step:.1f}"): print("PAN 실패(단계적)."); sys.exit(1)
+                    temp_target_for_step = next_angle_step
+                    current_pan_angle = next_angle_step # 실제 보내진 각도로 업데이트
+                    time.sleep(delay_per_step) # 각 스텝 후 짧은 대기
+                print("단계적 PAN 이동 완료.")
+
+            # 최종 목표 각도로 (또는 남은 차이만큼) 이동
+            if not send_serial_command(ser, f"PAN:{target_pan_angle_cmd:.1f}"): print("PAN 실패(최종)."); sys.exit(1)
+            current_pan_angle = target_pan_angle_cmd
+            time.sleep(DELAY + 0.2) # 최종 이동 후 안정화 시간 (조금 더 길게)
+        else:
+            print("미세 조정 불필요. 현재 각도 유지.")
+            time.sleep(DELAY / 2)
+    else: # while 루프 최대 시도 초과
+        error_msg = "최대 팬 정렬 시도 횟수를 초과했습니다."
+        print(error_msg)
+        status_texts.append(error_msg)
+        if display_frame_with_info(last_displayed_frame, status_texts=status_texts): pass
+        time.sleep(2)
+        sys.exit(1)
+
+
+    # --- Stage 2: 사전 정의된 잡기 및 가져오기 동작 ---
+    print("\n--- Stage 2: 사전 정의된 잡기 및 가져오기 동작 시작 ---")
+    status_texts.append("Stage 2: Pick & Retrieve Maneuver")
+    if display_frame_with_info(last_displayed_frame, status_texts=status_texts): sys.exit(0) # 현재 상태 한번 보여주기
+
+    # 1. 팔 뻗기 및 그리퍼 열기
+    action_msg = f"Reaching: IK:{REACH_OUT_J1},{REACH_OUT_J2} | Gripper Open: {GRIPPER_OPEN_CMD}"
+    print(action_msg)
+    status_texts.append(action_msg)
+    if not send_serial_command(ser, f"IK:{REACH_OUT_J1},{REACH_OUT_J2}"): print("IK (뻗기) 실패."); sys.exit(1)
+    time.sleep(DELAY) # IK 이동 대기
+    if not send_serial_command(ser, f"GRIP:{GRIPPER_OPEN_CMD}"): print("GRIP (열기) 실패."); sys.exit(1)
+    if display_frame_with_info(last_displayed_frame, status_texts=status_texts): sys.exit(0)
+    time.sleep(GRIP_DELAY)
+
+    # 2. 그리퍼 닫기 (물건 잡기)
+    action_msg = f"Gripping: Close Gripper to {GRIPPER_CLOSE_CMD}"
+    print(action_msg)
+    status_texts[-1] = action_msg # 이전 메시지 교체 또는 추가
+    if not send_serial_command(ser, f"GRIP:{GRIPPER_CLOSE_CMD}"): print("GRIP (닫기) 실패."); sys.exit(1)
+    if display_frame_with_info(last_displayed_frame, status_texts=status_texts): sys.exit(0)
+    time.sleep(DELAY + 0.5) # 그리퍼 닫는 시간
+
+    # 3. 물건 가져오기 (팔 접기)
+    action_msg = f"Retrieving: IK:{RETRIEVE_J1},{RETRIEVE_J2}"
+    print(action_msg)
+    status_texts[-1] = action_msg
+    if not send_serial_command(ser, f"IK:{RETRIEVE_J1},{RETRIEVE_J2}"): print("IK (가져오기) 실패."); sys.exit(1)
+    if display_frame_with_info(last_displayed_frame, status_texts=status_texts): sys.exit(0)
+    time.sleep(GRIP_DELAY)
+
+    final_message = "Task Complete! Object action finished."
+    print(f"\n--- {final_message} ---")
+    status_texts.append(final_message)
+    if display_frame_with_info(last_displayed_frame, status_texts=status_texts): pass
+    time.sleep(3) # 최종 상태 확인 시간
+
+except serial.SerialException as e: print(f"치명적 시리얼 오류: {e}"); traceback.print_exc()
+except IOError as e: print(f"치명적 파일/카메라 오류: {e}"); traceback.print_exc()
+except FileNotFoundError as e: print(f"파일 없음 오류: {e}"); traceback.print_exc()
+except Exception as e:
+    print(f"예상치 못한 최상위 오류 발생: {e}")
+    traceback.print_exc()
+finally:
+    print("\n--- 정리 작업 시작 ---")
+    if ser and ser.is_open:
+        try:
+            print("로봇 팔 초기 위치로 복귀 시도...")
+            # 순서: 그리퍼 열기 -> 팔 접기 -> 팬 중앙
+            send_serial_command(ser, f"GRIP:{GRIPPER_OPEN_CMD}"); time.sleep(DELAY)
+            send_serial_command(ser, f"IK:{JOINT1_INIT},{JOINT2_INIT}"); time.sleep(DELAY * 1.5) # IK는 조금 더 시간 필요
+            send_serial_command(ser, f"PAN:{PAN_INIT}"); time.sleep(DELAY)
+            print("로봇 팔 초기 위치 복귀 명령 전송 완료.")
+        except Exception as e_clean:
+            print(f"정리 중 시리얼 명령 전송 오류: {e_clean}")
+        finally:
+            ser.close()
+            print("시리얼 포트가 닫혔습니다.")
+    else:
+        print("시리얼 포트가 열려있지 않았거나 초기화되지 않았습니다.")
+
+    if cap_L and cap_L.isOpened():
+        cap_L.release()
+        print("왼쪽 카메라가 해제되었습니다.")
+
+    cv2.destroyAllWindows()
+    print("모든 OpenCV 창이 닫혔습니다.")
+    print("--- 스크립트 실행 종료 ---")
+
